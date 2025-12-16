@@ -5,223 +5,332 @@ import matplotlib.pyplot as plt
 import io
 
 # ==========================================
-# 1. 页面基础设置
+# 1. 页面配置与字体处理
 # ==========================================
-st.set_page_config(page_title="定投策略回测工具", layout="wide")
-st.title("📈 智能定投策略回测工具")
-st.markdown("这是基于历史数据的定投回测演示。您可以调整侧边栏的参数，查看不同策略下的收益表现。")
+st.set_page_config(page_title="原版定投策略回测", layout="wide")
+st.title("📈 复杂策略定投回测 (PB+MA120逃顶版)")
 
-# ==========================================
-# 2. 解决云端中文显示问题 (关键步骤)
-# ==========================================
+# 解决云端中文显示
 def configure_plots():
     plt.rcParams['axes.unicode_minus'] = False
-    # 尝试多种常见字体，适配不同系统（Windows/Linux/Mac）
     fonts = ['SimHei', 'Microsoft YaHei', 'PingFang SC', 'WenQuanYi Micro Hei', 'sans-serif']
     for font in fonts:
         try:
             plt.rcParams['font.sans-serif'] = [font]
-            break
+            # 验证字体是否真的可用
+            from matplotlib.font_manager import findfont, FontProperties
+            if findfont(FontProperties(family=[font])):
+                break
         except:
             continue
 configure_plots()
 
 # ==========================================
-# 3. 数据加载函数 (带缓存，提升速度)
+# 2. 数据加载 (适配 Streamlit)
 # ==========================================
 @st.cache_data
-def load_data(uploaded_file):
+def load_data_dict(uploaded_file):
+    """
+    完全复用你原代码的数据解析逻辑，将所有指数数据解析为字典
+    """
+    indices_data = {}
     try:
-        # 使用你原本的逻辑读取复杂表头
         df_raw = pd.read_csv(uploaded_file, header=None)
-        
         names_row = 3
         start_data_row = 5
         
-        # 处理收盘价数据
-        close_names = df_raw.iloc[names_row, 0:37].values
-        close_names[0] = 'date'
+        close_names = df_raw.iloc[names_row, 0:37].values; close_names[0] = 'date'
+        pb_names = df_raw.iloc[names_row, 38:75].values; pb_names[0] = 'date'
         
-        df_close = df_raw.iloc[start_data_row:, 0:37].copy()
-        df_close.columns = close_names
+        df_close = df_raw.iloc[start_data_row:, 0:37].copy(); df_close.columns = close_names
         df_close['date'] = pd.to_datetime(df_close['date'], errors='coerce')
         df_close.set_index('date', inplace=True)
         
-        # 确保全部转为数值型
-        for col in df_close.columns:
-            df_close[col] = pd.to_numeric(df_close[col], errors='coerce')
-            
-        return df_close
+        df_pb = df_raw.iloc[start_data_row:, 38:75].copy(); df_pb.columns = pb_names
+        df_pb['date'] = pd.to_datetime(df_pb['date'], errors='coerce')
+        df_pb.set_index('date', inplace=True)
+        
+        valid_tickers = [t for t in close_names[1:] if isinstance(t, str)]
+        for t in valid_tickers:
+            s_close = pd.to_numeric(df_close[t], errors='coerce')
+            s_pb = pd.to_numeric(df_pb[t], errors='coerce')
+            df_t = pd.DataFrame({'close': s_close, 'pb': s_pb})
+            df_t.dropna(inplace=True)
+            df_t.sort_index(inplace=True)
+            # 原逻辑：数据量大于1250才处理（因为要计算rolling window）
+            if len(df_t) > 1250: 
+                indices_data[t] = df_t
+        
+        return indices_data
     except Exception as e:
         st.error(f"数据解析失败: {e}")
-        return None
+        return {}
 
 # ==========================================
-# 4. 回测逻辑核心 (从你的类中提取并简化)
+# 3. 核心策略逻辑 (完全保留 BacktestTool.run)
 # ==========================================
-def run_backtest(df, target_index, tp_configs, start_date, end_date):
-    # 筛选时间
-    mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
-    data = df.loc[mask, target_index].dropna()
+def run_strategy(df_origin, tp_config, mtop_threshold, initial_capital=1000000, bond_yield=0.03):
+    # 复制数据防止修改原件
+    df = df_origin.copy()
     
-    if data.empty:
-        return None, "该时间段无数据"
-
-    # 初始化变量
-    cash = 0
-    share = 0
-    total_invest = 0
-    base_invest = 1000 # 假设每次定投1000元
+    # --- 原代码常量 ---
+    WINDOW_SIZE = 1250
+    MA_EXIT_WINDOW = 120
+    INVEST_PERIOD_DAYS = 500
+    MA_EXIT_BUFFER_PCT = 0.03
+    BASE_POSITION_PCT = 0.30
+    FEE_RATE = 0.0001
     
+    # --- 指标计算 ---
+    df['ma120'] = df['close'].rolling(window=MA_EXIT_WINDOW).mean()
+    df['pb_min'] = df['pb'].rolling(window=WINDOW_SIZE).quantile(0.05)
+    df['pb_max'] = df['pb'].rolling(window=WINDOW_SIZE).quantile(0.95)
+    range_val = df['pb_max'] - df['pb_min']
+    # 避免除以0
+    df['pb_score'] = np.where(range_val == 0, 0, (df['pb'] - df['pb_min']) / range_val)
+    
+    # --- 初始化状态 ---
+    cash = initial_capital
+    shares = 0.0
+    avg_cost = 0.0
     history = []
-    last_tp_idx = -1
+    events = []
+    tp_triggered = [False] * len(tp_config)
+    breakdown_count = 0
+    recovered_flag = False
+    daily_yield_rate = (1 + bond_yield) ** (1/252) - 1
     
-    for date, price in data.items():
-        # 1. 买入 (定投)
-        share += base_invest / price
-        total_invest += base_invest
+    # 确定遍历起始点
+    start_idx = max(WINDOW_SIZE, MA_EXIT_WINDOW)
+    if start_idx >= len(df):
+        return None, []
+
+    # --- 逐日回测循环 ---
+    for i in range(start_idx, len(df)):
+        date = df.index[i]
+        price = df['close'].iloc[i]
+        pb_score = df['pb_score'].iloc[i]
+        ma120 = df['ma120'].iloc[i]
         
-        # 2. 计算当前状态
-        current_value = share * price
-        current_return = (current_value - total_invest) / total_invest if total_invest > 0 else 0
+        if pd.isna(pb_score) or pd.isna(ma120): continue
         
-        action = None
+        # 现金理财收益
+        if cash > 0: cash *= (1 + daily_yield_rate)
         
-        # 3. 止盈检查
-        # 如果收益率为负，重置止盈等级（根据你的逻辑调整）
-        if current_return < 0:
-            last_tp_idx = -1
+        equity = cash + shares * price
+        current_pos_pct = (shares * price) / equity if equity > 0 else 0
+        
+        # === 1. 底仓买入逻辑 ===
+        if pb_score < 0.20 and current_pos_pct < 0.05:
+            target_spend = equity * BASE_POSITION_PCT
+            if target_spend <= cash:
+                buy_val = target_spend
+                fee = buy_val * FEE_RATE
+                new_shares = (buy_val - fee) / price
+                
+                if shares > 0: avg_cost = (shares * avg_cost + buy_val) / (shares + new_shares)
+                else: avg_cost = buy_val / new_shares
+                
+                shares += new_shares
+                cash -= buy_val
+                events.append({'date': date, 'price': price, 'type': '底仓买入', 'color': 'green', 'marker': '^'})
+                # 更新一下equity
+                equity = cash + shares * price
+
+        # === 2. 每日定投逻辑 (基于PB分数的动态定投) ===
+        daily_invest = equity / INVEST_PERIOD_DAYS
+        buy_val = 0
+        if pb_score < 0.00: buy_val = daily_invest * 2.0
+        elif pb_score < 0.10: buy_val = daily_invest * 1.0
+        elif pb_score < 0.20: buy_val = daily_invest * 0.5
+        
+        if buy_val > 0 and buy_val <= cash:
+            fee = buy_val * FEE_RATE
+            new_shares = (buy_val - fee) / price
             
-        for idx, conf in enumerate(tp_configs):
-            # 只有达到更高一级，且满足收益率要求才卖出
-            if idx > last_tp_idx and current_return >= conf['return']:
-                sell_ratio = conf['sell_pct']
-                sell_share = share * sell_ratio
+            if shares > 0: avg_cost = (shares * avg_cost + buy_val) / (shares + new_shares)
+            else: avg_cost = buy_val / new_shares
+            
+            shares += new_shares
+            cash -= buy_val
+
+        # === 3. 卖出逻辑 (止盈 + MA120逃顶) ===
+        if shares > 0:
+            # 止盈检查
+            ret = (price / avg_cost) - 1
+            for j, level in enumerate(tp_config):
+                if not tp_triggered[j] and ret >= level['return']:
+                    sell_shares = shares * level['sell_pct']
+                    val_sold = sell_shares * price
+                    fee = val_sold * FEE_RATE
+                    cash += val_sold - fee
+                    shares -= sell_shares
+                    tp_triggered[j] = True
+                    events.append({'date': date, 'price': price, 'type': f'止盈 {int(level["return"]*100)}%', 'color': 'purple', 'marker': '*'})
+            
+            # 逃顶检查 (仅当高估时触发)
+            if pb_score > mtop_threshold:
+                is_below_limit = price < ma120 * (1 - MA_EXIT_BUFFER_PCT)
+                is_above_ma = price > ma120
                 
-                cash += sell_share * price
-                share -= sell_share
-                
-                last_tp_idx = idx
-                action = f"止盈 L{idx+1}"
-                break # 同一天只触发一次
+                if breakdown_count == 0:
+                    if is_below_limit:
+                        breakdown_count = 1
+                        recovered_flag = False
+                        events.append({'date': date, 'price': price, 'type': '预警', 'color': 'orange', 'marker': 'x'})
+                elif breakdown_count == 1:
+                    if is_above_ma:
+                        recovered_flag = True
+                    elif is_below_limit and recovered_flag:
+                        # 确认跌破，清仓
+                        val_sold = shares * price
+                        fee = val_sold * FEE_RATE
+                        cash += val_sold - fee
+                        shares = 0
+                        tp_triggered = [False] * len(tp_config) # 重置止盈
+                        breakdown_count = 0
+                        recovered_flag = False
+                        avg_cost = 0
+                        events.append({'date': date, 'price': price, 'type': '清仓', 'color': 'red', 'marker': 'v'})
+            else:
+                breakdown_count = 0
+                recovered_flag = False
         
-        total_asset = cash + (share * price)
-        nav = total_asset # 这里的nav其实是总资产
-        
+        # 记录
+        stock_val = shares * price
         history.append({
-            'date': date,
-            'price': price,
-            'nav': nav,
-            'invest': total_invest,
-            'return': (nav - total_invest) / total_invest,
-            'action': action
+            'date': date, 
+            'nav': cash + stock_val, 
+            'cash': cash, 
+            'stock': stock_val, 
+            'close': price
         })
         
-    return pd.DataFrame(history), None
+    return pd.DataFrame(history).set_index('date'), events
 
 # ==========================================
-# 5. 侧边栏：用户控制区
+# 4. Streamlit 界面交互
 # ==========================================
-st.sidebar.header("⚙️ 参数设置")
 
-# 文件上传
-uploaded_file = st.sidebar.file_uploader("上传数据文件 (CSV)", type=['csv'])
-# 如果没有上传，尝试读取本地默认文件（方便你本地调试）
+# 侧边栏：参数区
+st.sidebar.header("⚙️ 策略参数")
+default_csv = "申万行业及宽基指数.csv"
+uploaded_file = st.sidebar.file_uploader("上传数据", type=['csv'])
+
+# 尝试加载默认数据
 if not uploaded_file:
-    try:
-        default_csv = "申万行业及宽基指数.csv"
-        # 只是为了演示，实际部署时建议必须上传或将文件打包
-        import os
-        if os.path.exists(default_csv):
-            uploaded_file = default_csv
-            st.sidebar.info(f"使用默认数据: {default_csv}")
-    except:
-        pass
+    import os
+    if os.path.exists(default_csv):
+        uploaded_file = default_csv
+        st.sidebar.info("使用默认内置数据")
 
 if uploaded_file:
-    df_close = load_data(uploaded_file)
+    # 1. 加载数据
+    indices_data = load_data_dict(uploaded_file)
     
-    if df_close is not None:
-        # 指数选择
-        indices = list(df_close.columns)
-        default_idx = indices.index('创业板指') if '创业板指' in indices else 0
-        target_index = st.sidebar.selectbox("选择回测指数", indices, index=default_idx)
+    if indices_data:
+        idx_names = list(indices_data.keys())
+        # 默认选中“创业板指”
+        default_idx = idx_names.index('创业板指') if '创业板指' in idx_names else 0
+        target_index = st.sidebar.selectbox("回测标的", idx_names, index=default_idx)
         
-        # 时间选择
-        min_date = df_close.index.min().date()
-        max_date = df_close.index.max().date()
+        # 2. 参数设置
+        bond_yield = st.sidebar.number_input("现金/债基年化收益率", value=0.03, step=0.01, format="%.2f")
+        mtop_threshold = st.sidebar.slider("逃顶 PB 分数阈值 (MTOP)", 0.0, 1.0, 0.30, 0.05)
         
-        col1, col2 = st.sidebar.columns(2)
-        start_date = col1.date_input("开始日期", min_date)
-        end_date = col2.date_input("结束日期", max_date)
-        
-        # 止盈策略配置
-        st.sidebar.subheader("💰 止盈策略配置")
-        
-        tp_configs = []
-        # Level 1
-        with st.sidebar.expander("第一级止盈", expanded=True):
-            r1 = st.number_input("触发收益率 (%)", value=30.0, key="r1") / 100
-            s1 = st.number_input("卖出仓位 (%)", value=20.0, key="s1") / 100
-            tp_configs.append({'return': r1, 'sell_pct': s1})
+        st.sidebar.subheader("分批止盈配置")
+        # 简单的动态列表模拟
+        tp_levels = st.sidebar.number_input("止盈级数", 1, 5, 3)
+        tp_config = []
+        for i in range(tp_levels):
+            c1, c2 = st.sidebar.columns(2)
+            # 默认值参考你的代码：30%/20%, 60%/30%, 100%/50%
+            def_ret = [30.0, 60.0, 100.0, 150.0, 200.0]
+            def_sell = [20.0, 30.0, 50.0, 100.0, 100.0]
             
-        # Level 2
-        with st.sidebar.expander("第二级止盈", expanded=False):
-            r2 = st.number_input("触发收益率 (%)", value=50.0, key="r2") / 100
-            s2 = st.number_input("卖出仓位 (%)", value=30.0, key="s2") / 100
-            tp_configs.append({'return': r2, 'sell_pct': s2})
+            r = c1.number_input(f"Level {i+1} 收益(%)", value=def_ret[i] if i<5 else 50.0, key=f"r{i}")
+            s = c2.number_input(f"Level {i+1} 卖出(%)", value=def_sell[i] if i<5 else 50.0, key=f"s{i}")
+            tp_config.append({'return': r/100, 'sell_pct': s/100})
             
-        # 运行按钮
-        if st.button("开始回测", type="primary"):
-            res, msg = run_backtest(df_close, target_index, tp_configs, start_date, end_date)
+        # 3. 运行回测
+        if st.button("🚀 开始回测", type="primary"):
+            st.divider()
+            with st.spinner("策略回测计算中..."):
+                res, events = run_strategy(
+                    indices_data[target_index], 
+                    tp_config, 
+                    mtop_threshold, 
+                    initial_capital=1000000, 
+                    bond_yield=bond_yield
+                )
             
-            if msg:
-                st.error(msg)
-            else:
-                # ==========================================
-                # 6. 结果展示区
-                # ==========================================
-                final = res.iloc[-1]
+            if res is not None and not res.empty:
+                # 4. 结果计算
+                final_nav = res['nav'].iloc[-1]
+                initial_nav = 1000000
+                total_ret = (final_nav / initial_nav - 1) * 100
                 
-                # 关键指标卡片
-                k1, k2, k3 = st.columns(3)
-                k1.metric("最终总资产", f"{final['nav']:,.0f} 元")
-                k2.metric("累计投入本金", f"{final['invest']:,.0f} 元")
-                ret_pct = final['return'] * 100
-                k3.metric("总收益率", f"{ret_pct:.2f}%", delta=f"{ret_pct:.2f}%")
+                # 指标展示
+                c1, c2, c3 = st.columns(3)
+                c1.metric("初始资金", "1,000,000")
+                c2.metric("最终净值", f"{final_nav:,.0f}")
+                c3.metric("总收益率", f"{total_ret:.2f}%", delta=f"{total_ret:.2f}%")
                 
-                # 绘图
-                st.subheader("📊 净值走势图")
-                fig, ax1 = plt.subplots(figsize=(12, 6))
+                # 5. 绘图 (严格按照你的 plot 函数复刻)
+                st.subheader("资产与净值走势")
                 
-                # 绘制指数 (右轴，灰色背景)
-                ax2 = ax1.twinx()
-                ax2.plot(res['date'], res['price'], color='gray', alpha=0.3, label='指数价格')
-                ax2.set_ylabel('指数点位', color='gray')
+                # 创建画布
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
                 
-                # 绘制净值 (左轴，红色实线)
-                ax1.plot(res['date'], res['nav'], color='#ff4b4b', linewidth=2, label='账户资产')
-                ax1.set_ylabel('账户资产 (元)', color='#ff4b4b')
-                
-                # 标记止盈点
-                sells = res[res['action'].notna()]
-                if not sells.empty:
-                    ax1.scatter(sells['date'], sells['nav'], color='green', marker='v', s=100, label='止盈卖出', zorder=5)
-                
-                # 图例和样式
-                lines1, labels1 = ax1.get_legend_handles_labels()
-                lines2, labels2 = ax2.get_legend_handles_labels()
-                ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+                # 图1: 资产配置 (堆叠图)
+                ax1.stackplot(res.index, res['stock'], res['cash'], 
+                              labels=['股票市值', '现金/债基'], colors=['#d62728', '#95a5a6'], alpha=0.8)
+                ax1.set_title(f"{target_index} - 资产配置", fontsize=14, fontweight='bold')
+                ax1.set_ylabel('资产金额')
+                ax1.legend(loc='upper left', framealpha=0.8, fancybox=True) 
                 ax1.grid(True, alpha=0.3)
-                ax1.set_title(f"{target_index} 定投回测结果 ({start_date} 至 {end_date})")
                 
-                st.pyplot(fig)
+                # 图2: 净值与信号
+                ax2.plot(res.index, res['nav'], color='#d62728', linewidth=2, label='策略净值', zorder=1)
                 
-                # 详细数据表
-                with st.expander("查看详细交易流水"):
-                    st.dataframe(res)
+                # 基准 (按照第一天的比例对齐)
+                base_nav = res['nav'].iloc[0]
+                bench_nav = res['close'] / res['close'].iloc[0] * base_nav
+                ax2.plot(res.index, bench_nav, color='gray', linestyle=':', label='指数基准', zorder=1)
+                
+                # 绘制交易信号 (完全保留你的逻辑)
+                if events:
+                    evt_df = pd.DataFrame(events)
+                    types = list(set([e['type'] for e in events]))
+                    colors = {'底仓买入': 'green', '预警': 'orange', '清仓': 'red'}
+                    markers = {'底仓买入': '^', '预警': 'x', '清仓': 'v'}
+                    
+                    for t in types:
+                        if '止盈' in t: c = 'purple'; m = '*'
+                        else: c = colors.get(t, 'blue'); m = markers.get(t, 'o')
+                        
+                        subset = evt_df[evt_df['type'] == t]
+                        
+                        # 🔥🔥🔥 你的关键修改：Y轴坐标取当时的净值(nav) 🔥🔥🔥
+                        y_values = res.loc[subset['date'], 'nav']
+                        
+                        ax2.scatter(subset['date'], y_values, marker=m, color=c, s=80, label=t, zorder=5)
 
+                ax2.set_title("净值增长与交易信号", fontsize=14, fontweight='bold')
+                ax2.set_ylabel('净值 (元)')
+                
+                # 图例设置
+                ax2.legend(loc='upper left', bbox_to_anchor=(0.01, 0.99), ncol=3, framealpha=0.9, fancybox=True, shadow=True)
+                ax2.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                st.pyplot(fig) # 使用 Streamlit 的方法显示图表
+                
+                # 6. 显示详细数据
+                with st.expander("查看详细交易记录"):
+                    st.dataframe(pd.DataFrame(events))
+                    st.dataframe(res)
+            else:
+                st.warning("该指数在选定参数下无法计算（可能数据长度不足1250天以计算PB分位点）。")
     else:
-        st.warning("数据加载未完成，请检查文件格式。")
-else:
-    st.info("👈 请在左侧上传 CSV 文件开始回测。")
+        st.error("数据文件中没有找到符合要求的指数（需大于1250天数据）。")
